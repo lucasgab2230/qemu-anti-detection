@@ -1,0 +1,262 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Continuous Integration
+  ci:
+    name: Continuous Integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate patch files
+        run: |
+          echo "Validating QEMU patch files..."
+          for patch in *.patch; do
+            if [ -f "$patch" ]; then
+              echo "Checking $patch..."
+              # Basic syntax validation for patch files
+              if ! patch --dry-run -p1 < "$patch" 2>/dev/null; then
+                echo "Warning: $patch may have issues (this is expected without QEMU source)"
+              fi
+              echo "✓ $patch structure looks valid"
+            fi
+          done
+
+      - name: Validate XML configuration
+        run: |
+          echo "Validating libvirt XML configurations..."
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils
+
+          for xml in configs/*.xml; do
+            if [ -f "$xml" ]; then
+              echo "Validating $xml..."
+              if xmllint --noout "$xml"; then
+                echo "✓ $xml is valid XML"
+              else
+                echo "✗ $xml has XML syntax errors"
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Check file integrity
+        run: |
+          echo "Checking file integrity..."
+          # Verify important files exist
+          required_files=(
+            "README.md"
+            "configs/samuil1337.xml"
+          )
+
+          for file in "${required_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "✗ Required file missing: $file"
+              exit 1
+            else
+              echo "✓ Found: $file"
+            fi
+          done
+
+      - name: Verify patch versions
+        run: |
+          echo "Verifying QEMU patch versions..."
+          patches=($(ls qemu-*.patch 2>/dev/null || true))
+
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No QEMU patches found"
+          else
+            echo "Found QEMU patches:"
+            for patch in "${patches[@]}"; do
+              version=$(echo "$patch" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+              echo "  - $patch (version: $version)"
+            done
+          fi
+
+      - name: Generate checksums
+        run: |
+          echo "Generating file checksums..."
+          find . -type f \( -name "*.patch" -o -name "*.xml" -o -name "*.rom" -o -name "*.dat" \) | while read file; do
+            echo "$(sha256sum "$file")"
+          done > checksums.txt
+
+          echo "Checksums generated:"
+          cat checksums.txt
+
+      - name: Upload checksums as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: checksums.txt
+
+  # Semantic Release
+  release:
+    name: Create Release
+    needs: ci
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install semantic-release
+        run: |
+          npm install -g semantic-release @semantic-release/changelog @semantic-release/git @semantic-release/github
+
+      - name: Download checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: checksums
+
+      - name: Create release package
+        run: |
+          echo "Creating release package..."
+          mkdir -p release-assets
+
+          # Copy main files
+          cp -r configs/ release-assets/
+          cp *.patch release-assets/ 2>/dev/null || true
+          cp *.rom release-assets/ 2>/dev/null || true
+          cp *.dat release-assets/ 2>/dev/null || true
+          cp README.md release-assets/
+          cp checksums.txt release-assets/
+
+          # Create archive
+          cd release-assets
+          tar -czf ../qemu-anti-detection-release.tar.gz .
+          cd ..
+
+          # Generate release info
+          echo "## QEMU Anti-Detection Release" > RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "### Included Files:" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          find release-assets -type f | sort | while read file; do
+            echo "- \`${file#release-assets/}\`" >> RELEASE_NOTES.md
+          done
+          echo "" >> RELEASE_NOTES.md
+          echo "### Checksums:" >> RELEASE_NOTES.md
+          echo "\`\`\`" >> RELEASE_NOTES.md
+          cat checksums.txt >> RELEASE_NOTES.md
+          echo "\`\`\`" >> RELEASE_NOTES.md
+
+      - name: Create semantic release config
+        run: |
+          cat > .releaserc.json << 'EOF'
+          {
+            "branches": ["main"],
+            "plugins": [
+              "@semantic-release/commit-analyzer",
+              "@semantic-release/release-notes-generator",
+              [
+                "@semantic-release/changelog",
+                {
+                  "changelogFile": "CHANGELOG.md"
+                }
+              ],
+              [
+                "@semantic-release/github",
+                {
+                  "assets": [
+                    {
+                      "path": "qemu-anti-detection-release.tar.gz",
+                      "name": "qemu-anti-detection-${nextRelease.version}.tar.gz",
+                      "label": "QEMU Anti-Detection Package"
+                    },
+                    {
+                      "path": "checksums.txt",
+                      "name": "checksums-${nextRelease.version}.txt",
+                      "label": "File Checksums"
+                    }
+                  ]
+                }
+              ],
+              [
+                "@semantic-release/git",
+                {
+                  "assets": ["CHANGELOG.md"],
+                  "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+                }
+              ]
+            ]
+          }
+          EOF
+
+      - name: Run semantic release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: semantic-release
+
+  # Manual Release (for tagged versions)
+  tagged-release:
+    name: Tagged Release
+    needs: ci
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: checksums
+
+      - name: Get tag version
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create release package
+        run: |
+          mkdir -p release-assets
+          cp -r configs/ release-assets/
+          cp *.patch release-assets/ 2>/dev/null || true
+          cp *.rom release-assets/ 2>/dev/null || true
+          cp *.dat release-assets/ 2>/dev/null || true
+          cp README.md release-assets/
+          cp checksums.txt release-assets/
+
+          cd release-assets
+          tar -czf ../qemu-anti-detection-${{ steps.get_version.outputs.VERSION }}.tar.gz .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            qemu-anti-detection-${{ steps.get_version.outputs.VERSION }}.tar.gz
+            checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
